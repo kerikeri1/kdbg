@@ -1,3 +1,4 @@
 kdbg
 test/hello
 *.o
+test/loop
