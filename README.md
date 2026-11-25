@@ -5,6 +5,12 @@ This is a learning project: the goal is to understand how debuggers like GDB act
 
 ## Build
 
+Requires [Capstone](https://www.capstone-engine.org/) for disassembly:
+
+```sh
+sudo apt install build-essential libcapstone-dev
+```
+
 ```sh
 make
 ./kdbg ./test/hello
@@ -23,6 +29,7 @@ make
 | `bl` | list breakpoints |
 | `x <loc> [n]` | hexdump `n` bytes of memory (default 32) |
 | `set <loc> <value>` | write a 64-bit value at `loc` |
+| `dis [loc] [n]` | disassemble `n` instructions (default: 8 from `rip`) |
 | `syms` | list function symbols |
 | `h`, `help` | show help |
 | `q`, `quit` | kill the target and exit |
@@ -35,7 +42,7 @@ make
 - [x] **M2** – software breakpoints (`int3` / `0xCC`) at an address
 - [x] **M3** – memory read/write (`x addr`, `set`)
 - [x] **M4** – symbols: ELF parsing (`.symtab`) → `break main`
-- [ ] **M5** – disassembly of the current instruction (Capstone)
+- [x] **M5** – disassembly of the current instruction (Capstone)
 - [ ] **M6** – attach to a running process (`PTRACE_ATTACH`)
 - [ ] **M7** – backtrace by walking the `rbp` chain
 
@@ -110,4 +117,20 @@ kdbg> c                    # hit breakpoint 0 at 0x401126 <show>
 kdbg> s                    # rip = 0x401127 <show+1>
 kdbg> x secret 8
 kdbg> set secret 1337
+```
+
+## How it works (M5)
+
+- Disassembly uses [Capstone](https://www.capstone-engine.org/) (`cs_open`, `cs_disasm`) in x86-64 mode with Intel syntax.
+- x86 instructions are 1 to 15 bytes long, so kdbg reads `n * 15` bytes (the worst case) and lets Capstone decode as many instructions as it can.
+- Breakpoint bytes (`0xCC`) are replaced with the original bytes before disassembling.
+- After every `step` and breakpoint hit, the current instruction is shown; in `dis` output it is marked with `=>`.
+- Direct `call`/`jmp` targets are annotated with the symbol name when known.
+
+```sh
+./kdbg ./test/vars
+kdbg> dis main 6           # see the two calls to show()
+kdbg> b show
+kdbg> c                    # => 0x401126 <show>: push rbp
+kdbg> s                    # => 0x401127 <show+1>: mov rbp, rsp
 ```

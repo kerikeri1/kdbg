@@ -1,10 +1,11 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -O0
+LDLIBS  = -lcapstone
 
 all: kdbg test/hello test/loop test/vars test/crash test/vars_pie
 
 kdbg: src/main.c src/elf.c src/elf.h
-	$(CC) $(CFLAGS) -o $@ src/main.c src/elf.c
+	$(CC) $(CFLAGS) -o $@ src/main.c src/elf.c $(LDLIBS)
 
 test/hello: test/hello.c
 	$(CC) -g -O0 -no-pie -o $@ $^

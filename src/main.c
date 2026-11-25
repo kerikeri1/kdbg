@@ -4,6 +4,7 @@
  * Milestone 2: software breakpoints (int3 / 0xCC).
  * Milestone 3: memory read/write (x, set).
  * Milestone 4: ELF symbols (b main, x secret, <func+off> in output).
+ * Milestone 5: disassembly with Capstone (dis, current instruction on stop).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -18,6 +19,8 @@
 #include <sys/user.h>
 #include <sys/personality.h>
 
+#include <capstone/capstone.h>
+
 #include "elf.h"
 
 static pid_t child;
@@ -31,6 +34,9 @@ static int wait_child(void);
 static int pending_signal;
 
 static void print_location(uint64_t addr);
+static void show_current_instruction(void);
+
+static csh cs_handle;  /* Capstone disassembler handle */
 
 /* ---------------------------------------------------------------------------
  * Breakpoints
@@ -141,6 +147,7 @@ static void handle_breakpoint_hit(void)
     ptrace(PTRACE_SETREGS, child, NULL, &r);
 
     pending_rearm = bp;
+    show_current_instruction();
 }
 
 /*
@@ -231,6 +238,80 @@ static void set_memory(uint64_t addr, uint64_t value)
         return;
     }
     printf("0x%lx <- 0x%lx\n", addr, value);
+}
+
+/* ---------------------------------------------------------------------------
+ * Disassembly (Capstone)
+ * ------------------------------------------------------------------------- */
+
+#define MAX_INSN_LEN 15  /* longest possible x86 instruction, in bytes */
+
+/*
+ * Disassemble count instructions starting at addr.
+ * x86 instructions have variable length, so we read count * 15 bytes
+ * (the worst case) and let Capstone decode as many as it can.
+ * The instruction at the current rip is marked with "=>".
+ */
+static void disassemble(uint64_t addr, size_t count)
+{
+    uint8_t code[32 * MAX_INSN_LEN];
+    if (count > 32)
+        count = 32;
+
+    /*
+     * Read word by word and stop at the first unreadable address: near the
+     * end of a mapping, count * 15 bytes may go past it, but the bytes we
+     * did read can still be disassembled.
+     */
+    size_t len = 0, want = count * MAX_INSN_LEN;
+    while (len < want) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, child, (void *)(addr + len), NULL);
+        if (errno)
+            break;
+        size_t chunk = want - len < sizeof word ? want - len : sizeof word;
+        memcpy(code + len, &word, chunk);
+        len += chunk;
+    }
+    if (len == 0) {
+        printf("cannot read memory at 0x%lx\n", addr);
+        return;
+    }
+    hide_breakpoints(addr, code, len);  /* show original bytes, not 0xCC */
+
+    struct user_regs_struct r;
+    ptrace(PTRACE_GETREGS, child, NULL, &r);
+
+    cs_insn *insn;
+    size_t n = cs_disasm(cs_handle, code, len, addr, count, &insn);
+    if (n == 0) {
+        printf("cannot disassemble at 0x%lx\n", addr);
+        return;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        printf("%s ", insn[i].address == r.rip ? "=>" : "  ");
+        print_location(insn[i].address);
+        printf(":\t%s\t%s", insn[i].mnemonic, insn[i].op_str);
+
+        /* For call/jmp to a direct address, show the target symbol */
+        if ((insn[i].mnemonic[0] == 'j' || !strcmp(insn[i].mnemonic, "call")) &&
+            !strncmp(insn[i].op_str, "0x", 2)) {
+            const struct symbol *sym = elf_symbol_at(strtoull(insn[i].op_str, NULL, 16));
+            if (sym)
+                printf("\t<%s>", sym->name);
+        }
+        putchar('\n');
+    }
+    cs_free(insn, n);
+}
+
+/* Print the instruction at rip: called after every step and breakpoint hit */
+static void show_current_instruction(void)
+{
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, child, NULL, &r) == 0)
+        disassemble(r.rip, 1);
 }
 
 static void list_breakpoints(void)
@@ -351,6 +432,7 @@ static void help(void)
          "  bl             list breakpoints\n"
          "  x <loc> [n]    dump n bytes of memory (default 32)\n"
          "  set <loc> <v>  write a 64-bit value at loc\n"
+         "  dis [loc] [n]  disassemble n instructions (default: 8 from rip)\n"
          "  syms           list function symbols\n"
          "  h | help       this message\n"
          "  q | quit       kill the target and exit\n"
@@ -387,11 +469,7 @@ static void run_debugger(const char *path)
                 ptrace(PTRACE_SINGLESTEP, child, NULL, (void *)(long)pending_signal);
                 if (wait_child() < 0) return;
             }
-            struct user_regs_struct r;
-            ptrace(PTRACE_GETREGS, child, NULL, &r);
-            printf("rip = ");
-            print_location(r.rip);
-            putchar('\n');
+            show_current_instruction();
         } else if (!strcmp(line, "c") || !strcmp(line, "continue")) {
             if (step_over_breakpoint() < 0) return;
             ptrace(PTRACE_CONT, child, NULL, (void *)(long)pending_signal);
@@ -428,6 +506,21 @@ static void run_debugger(const char *path)
                     puts("usage: set <addr|symbol> <value>");
                 else
                     set_memory(addr, value);
+            }
+        } else if (!strcmp(line, "dis") || !strncmp(line, "dis ", 4)) {
+            /* dis [loc] [n]: default is 8 instructions from rip */
+            uint64_t addr;
+            char *end = line + 3;
+            int rc = parse_address(line + 3, &addr, &end);
+            if (rc == -1) {
+                struct user_regs_struct r;
+                ptrace(PTRACE_GETREGS, child, NULL, &r);
+                addr = r.rip;
+                rc = 0;
+            }
+            if (rc == 0) {
+                size_t count = strtoul(end, NULL, 0);
+                disassemble(addr, count ? count : 8);
             }
         } else if (!strcmp(line, "syms")) {
             elf_list_functions();
@@ -475,7 +568,14 @@ int main(int argc, char **argv)
         _exit(1);
     }
 
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &cs_handle) != CS_ERR_OK) {
+        fprintf(stderr, "cannot initialize Capstone\n");
+        return 1;
+    }
+
     run_debugger(argv[1]);
+
+    cs_close(&cs_handle);
     elf_free_symbols();
     return 0;
 }
