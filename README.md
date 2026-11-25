@@ -18,6 +18,15 @@ make
 
 > **Note:** addresses in the examples below come from one specific build. Your compiler may lay out the binary differently (e.g. with or without `endbr64`), so always check them with `nm`. A breakpoint placed in the middle of an instruction corrupts it and usually crashes the program.
 
+## Usage
+
+```sh
+./kdbg <program> [args...]   # launch a program under the debugger
+./kdbg -p <pid>              # attach to a running process
+```
+
+Press **Ctrl+C** while the target is running to stop it and get back to the prompt.
+
 ## Commands
 
 | Command | Description |
@@ -30,9 +39,10 @@ make
 | `x <loc> [n]` | hexdump `n` bytes of memory (default 32) |
 | `set <loc> <value>` | write a 64-bit value at `loc` |
 | `dis [loc] [n]` | disassemble `n` instructions (default: 8 from `rip`) |
+| `bt` | backtrace (call stack) |
 | `syms` | list function symbols |
 | `h`, `help` | show help |
-| `q`, `quit` | kill the target and exit |
+| `q`, `quit` | kill the target (or detach, with `-p`) and exit |
 
 `<loc>` is either an address (`0x401126`) or a symbol name (`show`, `secret`).
 
@@ -43,8 +53,8 @@ make
 - [x] **M3** – memory read/write (`x addr`, `set`)
 - [x] **M4** – symbols: ELF parsing (`.symtab`) → `break main`
 - [x] **M5** – disassembly of the current instruction (Capstone)
-- [ ] **M6** – attach to a running process (`PTRACE_ATTACH`)
-- [ ] **M7** – backtrace by walking the `rbp` chain
+- [x] **M6** – attach to a running process (`PTRACE_ATTACH`)
+- [x] **M7** – backtrace by walking the `rbp` chain
 
 ## How it works (M1)
 
@@ -133,4 +143,40 @@ kdbg> dis main 6           # see the two calls to show()
 kdbg> b show
 kdbg> c                    # => 0x401126 <show>: push rbp
 kdbg> s                    # => 0x401127 <show+1>: mov rbp, rsp
+```
+
+## How it works (M6)
+
+- `kdbg -p <pid>` calls `PTRACE_ATTACH`, which stops the process with `SIGSTOP`. That stop is ours, so it is not forwarded on the next `continue`.
+- Symbols are loaded from `/proc/<pid>/exe`, the executable of the running process.
+- On `quit` (or Ctrl+D) every breakpoint byte is restored and the process is released with `PTRACE_DETACH`: it keeps running as if nothing happened.
+- On most distributions `ptrace_scope` is `1`, which only lets a process trace its own children. Attaching to an unrelated process then requires `sudo`.
+
+```sh
+./test/sleeper &           # prints a tick every second
+sudo ./kdbg -p $!
+kdbg> b tick
+kdbg> c
+kdbg> set counter 1000
+kdbg> q                    # detach: sleeper continues from tick 1001
+```
+
+## How it works (M7)
+
+With frame pointers, every function starts with `push rbp; mov rbp, rsp`, so each stack frame contains:
+
+```
+[rbp + 8]  return address   -> where the caller continues
+[rbp]      saved rbp        -> the caller's frame
+```
+
+`bt` follows the chain of saved `rbp` values up to `main`. When stopped inside the prologue (e.g. right after `b func`), `rbp` still belongs to the caller, so the return address is read from `[rsp]` or `[rsp + 8]` instead.
+
+Limitations: code compiled with `-fomit-frame-pointer` (common in optimized builds and libc) breaks the chain. Real debuggers use the DWARF unwind information in `.eh_frame` instead.
+
+```sh
+./kdbg ./test/nested
+kdbg> b level3
+kdbg> c
+kdbg> bt                   # level3 <- level2 <- level1 <- main
 ```

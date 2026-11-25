@@ -5,4 +5,6 @@ test/loop
 test/vars
 test/crash
 test/vars_pie
+test/nested
+test/sleeper
 test/vars_stripped

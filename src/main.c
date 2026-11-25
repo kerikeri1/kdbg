@@ -5,6 +5,8 @@
  * Milestone 3: memory read/write (x, set).
  * Milestone 4: ELF symbols (b main, x secret, <func+off> in output).
  * Milestone 5: disassembly with Capstone (dis, current instruction on stop).
+ * Milestone 6: attach to a running process (kdbg -p <pid>).
+ * Milestone 7: backtrace by walking the rbp chain (bt).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -18,12 +20,30 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/personality.h>
+#include <signal.h>
 
 #include <capstone/capstone.h>
 
 #include "elf.h"
 
 static pid_t child;
+static int attached;  /* 1 if we attached with -p (detach on exit, don't kill) */
+
+/*
+ * Ctrl+C while the target is running: stop it and return to the prompt.
+ * In launch mode the target shares our terminal and receives SIGINT itself;
+ * in attach mode it doesn't, so we stop it with SIGSTOP. Either way the
+ * signal is ours and must not be forwarded to the program.
+ */
+static volatile sig_atomic_t interrupted;
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    interrupted = 1;
+    if (attached)
+        kill(child, SIGSTOP);
+}
 
 static int wait_child(void);
 
@@ -345,6 +365,12 @@ static int wait_child(void)
         return -1;
     }
     pending_signal = 0;
+    if (WIFSTOPPED(status) && interrupted &&
+        (WSTOPSIG(status) == SIGINT || WSTOPSIG(status) == SIGSTOP)) {
+        interrupted = 0;
+        printf("\n[*] interrupted\n");
+        return 0;
+    }
     if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
         /* SIGTRAP is ours (breakpoints, single-step): never forward it */
         pending_signal = WSTOPSIG(status);
@@ -422,6 +448,127 @@ static int parse_address(const char *str, uint64_t *addr, char **rest)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Backtrace
+ *
+ * With frame pointers, every function starts with:
+ *     push rbp        ; save the caller's rbp
+ *     mov  rbp, rsp   ; rbp now points to the saved rbp
+ * so each frame looks like this (the stack grows towards lower addresses):
+ *
+ *     [rbp + 8]  return address  -> where the caller continues
+ *     [rbp]      saved rbp       -> the caller's frame
+ *
+ * Following saved rbp values walks from the current function up to main.
+ * ------------------------------------------------------------------------- */
+
+static int read_u64(uint64_t addr, uint64_t *value)
+{
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, child, (void *)addr, NULL);
+    if (errno)
+        return -1;
+    *value = (uint64_t)word;
+    return 0;
+}
+
+/*
+ * Where is the return address of the current function?
+ * The rbp chain is only valid after the prologue has run. If we are
+ * stopped on the first instructions of a function (typical with
+ * "b func"), rbp still belongs to the caller and the return address
+ * is found relative to rsp instead.
+ */
+static int prologue_state(uint64_t rip)
+{
+    const struct symbol *sym = elf_symbol_at(rip);
+    if (!sym || !sym->is_func)
+        return 2;  /* unknown: assume the prologue is done */
+
+    uint64_t start = sym->addr;
+    uint8_t code[8];
+    if (read_memory(start, code, sizeof code) < 0)
+        return 2;
+    hide_breakpoints(start, code, sizeof code);
+
+    /* skip endbr64 (f3 0f 1e fa) if the compiler added it */
+    if (!memcmp(code, "\xf3\x0f\x1e\xfa", 4))
+        start += 4;
+
+    if (rip <= start)
+        return 0;  /* before push rbp: return address at [rsp] */
+    if (rip == start + 1)
+        return 1;  /* after push rbp:  return address at [rsp + 8] */
+    return 2;      /* prologue done:   use the rbp chain */
+}
+
+static void backtrace(void)
+{
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, child, NULL, &r) < 0)
+        return;
+
+    int depth = 0;
+    printf("#%d  ", depth++);
+    print_location(r.rip);
+    putchar('\n');
+
+    uint64_t rbp = r.rbp;
+    uint64_t ret;
+
+    /* Frame 1 may need special handling if we are inside the prologue */
+    int state = prologue_state(r.rip);
+    if (state < 2) {
+        if (read_u64(r.rsp + 8 * state, &ret) < 0)
+            return;
+        printf("#%d  ", depth++);
+        print_location(ret);
+        putchar('\n');
+        const struct symbol *sym = elf_symbol_at(ret);
+        if (sym && !strcmp(sym->name, "main"))
+            return;
+    }
+
+    while (rbp && depth < 32) {
+        uint64_t saved_rbp;
+        if (read_u64(rbp, &saved_rbp) < 0 || read_u64(rbp + 8, &ret) < 0)
+            break;
+        if (!ret)
+            break;
+
+        printf("#%d  ", depth++);
+        print_location(ret);
+        putchar('\n');
+
+        /* stop at main: above it there is only libc startup code */
+        const struct symbol *sym = elf_symbol_at(ret);
+        if (sym && !strcmp(sym->name, "main"))
+            break;
+
+        if (saved_rbp <= rbp)  /* the stack grows down: frames go up */
+            break;
+        rbp = saved_rbp;
+    }
+}
+
+/*
+ * Leave the tracee as we found it: remove every 0xCC we wrote, then
+ * detach (attach mode) or kill it (launch mode).
+ */
+static void cleanup(void)
+{
+    if (attached) {
+        for (int i = 0; i < bp_count; i++)
+            if (bps[i].enabled)
+                write_byte(bps[i].addr, bps[i].orig_byte, NULL);
+        ptrace(PTRACE_DETACH, child, NULL, NULL);
+        printf("[*] detached from pid %d\n", child);
+    } else {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+    }
+}
+
 static void help(void)
 {
     puts("commands:\n"
@@ -433,9 +580,10 @@ static void help(void)
          "  x <loc> [n]    dump n bytes of memory (default 32)\n"
          "  set <loc> <v>  write a 64-bit value at loc\n"
          "  dis [loc] [n]  disassemble n instructions (default: 8 from rip)\n"
+         "  bt             backtrace (call stack)\n"
          "  syms           list function symbols\n"
          "  h | help       this message\n"
-         "  q | quit       kill the target and exit\n"
+         "  q | quit       kill the target (or detach, with -p) and exit\n"
          "<loc> is an address or a symbol name");
 
 }
@@ -444,9 +592,23 @@ static void run_debugger(const char *path)
 {
     char line[256];
 
-    if (wait_child() < 0)  /* first stop: SIGTRAP after execve */
-        return;
-    printf("[*] target started, pid %d (stopped at execve)\n", child);
+    if (attached) {
+        /*
+         * PTRACE_ATTACH stops the process by sending it SIGSTOP. We wait
+         * for that stop directly (not with wait_child) because this
+         * SIGSTOP is ours: it must not be forwarded on the next continue,
+         * or the process would stop again.
+         */
+        if (waitpid(child, NULL, 0) < 0) {
+            perror("waitpid");
+            return;
+        }
+        printf("[*] attached to pid %d\n", child);
+    } else {
+        if (wait_child() < 0)  /* first stop: SIGTRAP after execve */
+            return;
+        printf("[*] target started, pid %d (stopped at execve)\n", child);
+    }
 
     int n = elf_load_symbols(path, child);
     if (n >= 0)
@@ -455,8 +617,10 @@ static void run_debugger(const char *path)
     for (;;) {
         printf("kdbg> ");
         fflush(stdout);
-        if (!fgets(line, sizeof line, stdin))
-            break;
+        if (!fgets(line, sizeof line, stdin)) {
+            cleanup();  /* Ctrl+D */
+            return;
+        }
         line[strcspn(line, "\n")] = '\0';
 
         if (!strcmp(line, "r") || !strcmp(line, "regs")) {
@@ -522,13 +686,14 @@ static void run_debugger(const char *path)
                 size_t count = strtoul(end, NULL, 0);
                 disassemble(addr, count ? count : 8);
             }
+        } else if (!strcmp(line, "bt")) {
+            backtrace();
         } else if (!strcmp(line, "syms")) {
             elf_list_functions();
         } else if (!strcmp(line, "h") || !strcmp(line, "help")) {
             help();
         } else if (!strcmp(line, "q") || !strcmp(line, "quit")) {
-            kill(child, SIGKILL);
-            waitpid(child, NULL, 0);
+            cleanup();
             return;
         } else if (line[0]) {
             printf("unknown command: %s (try 'help')\n", line);
@@ -543,37 +708,77 @@ static void hide_breakpoints(uint64_t addr, uint8_t *buf, size_t len)
             buf[bps[i].addr - addr] = bps[i].orig_byte;
 }
 
+static void usage(const char *prog)
+{
+    fprintf(stderr, "usage: %s <program> [args...]\n"
+                    "       %s -p <pid>\n", prog, prog);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <program> [args...]\n", argv[0]);
+        usage(argv[0]);
         return 1;
     }
 
-    child = fork();
-    if (child < 0) {
-        perror("fork");
-        return 1;
-    }
+    char exe_path[4096];
+    const char *path;
 
-    if (child == 0) {
-        /* Child: request tracing, disable ASLR, exec the target */
-        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
-            perror("PTRACE_TRACEME");
+    if (!strcmp(argv[1], "-p")) {
+        /* Attach mode: trace a process that is already running */
+        if (argc < 3) {
+            usage(argv[0]);
+            return 1;
+        }
+        child = atoi(argv[2]);
+        if (ptrace(PTRACE_ATTACH, child, NULL, NULL) < 0) {
+            perror("PTRACE_ATTACH");
+            if (errno == EPERM)
+                fprintf(stderr, "hint: check /proc/sys/kernel/yama/ptrace_scope "
+                                "(1 = only root or a parent can attach)\n");
+            return 1;
+        }
+        attached = 1;
+
+        /* The executable of a running process is /proc/<pid>/exe */
+        char link[64];
+        snprintf(link, sizeof link, "/proc/%d/exe", child);
+        ssize_t len = readlink(link, exe_path, sizeof exe_path - 1);
+        exe_path[len > 0 ? len : 0] = '\0';
+        path = exe_path;
+    } else {
+        /* Launch mode: fork + exec the target */
+        child = fork();
+        if (child < 0) {
+            perror("fork");
+            return 1;
+        }
+
+        if (child == 0) {
+            /* Child: request tracing, disable ASLR, exec the target */
+            if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+                perror("PTRACE_TRACEME");
+                _exit(1);
+            }
+            personality(ADDR_NO_RANDOMIZE);
+            execvp(argv[1], &argv[1]);
+            perror("execvp");
             _exit(1);
         }
-        personality(ADDR_NO_RANDOMIZE);
-        execvp(argv[1], &argv[1]);
-        perror("execvp");
-        _exit(1);
+        path = argv[1];
     }
+
+    /* SA_RESTART: waitpid is restarted after the handler and then sees the stop */
+    struct sigaction sa = { .sa_handler = on_sigint, .sa_flags = SA_RESTART };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
 
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &cs_handle) != CS_ERR_OK) {
         fprintf(stderr, "cannot initialize Capstone\n");
         return 1;
     }
 
-    run_debugger(argv[1]);
+    run_debugger(path);
 
     cs_close(&cs_handle);
     elf_free_symbols();
