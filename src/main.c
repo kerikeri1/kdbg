@@ -1,6 +1,6 @@
 /*
- * kdbg - debugger minimale per Linux x86_64 basato su ptrace(2)
- * Milestone 1: avvio del target, registri, single-step, continue.
+ * kdbg - minimal Linux x86_64 debugger based on ptrace(2)
+ * Milestone 1: target launch, registers, single-step, continue.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -15,7 +15,7 @@
 
 static pid_t child;
 
-/* Aspetta il figlio e ritorna 0 se è ancora vivo (stoppato), -1 se è terminato */
+/* Wait for the child: returns 0 if it is still alive (stopped), -1 if it has terminated */
 static int wait_child(void)
 {
     int status;
@@ -24,15 +24,15 @@ static int wait_child(void)
         return -1;
     }
     if (WIFEXITED(status)) {
-        printf("[*] processo terminato, exit code %d\n", WEXITSTATUS(status));
+        printf("[*] process exited, exit code %d\n", WEXITSTATUS(status));
         return -1;
     }
     if (WIFSIGNALED(status)) {
-        printf("[*] processo ucciso dal segnale %d\n", WTERMSIG(status));
+        printf("[*] process killed by signal %d\n", WTERMSIG(status));
         return -1;
     }
     if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP)
-        printf("[*] stop per segnale %d\n", WSTOPSIG(status));
+        printf("[*] stopped by signal %d\n", WSTOPSIG(status));
     return 0;
 }
 
@@ -52,21 +52,21 @@ static void print_regs(void)
 
 static void help(void)
 {
-    puts("comandi:\n"
-         "  r | regs       mostra i registri\n"
-         "  s | step       esegue una singola istruzione\n"
-         "  c | continue   riprende l'esecuzione\n"
-         "  h | help       questo messaggio\n"
-         "  q | quit       termina il target ed esce");
+    puts("commands:\n"
+         "  r | regs       show registers\n"
+         "  s | step       execute a single instruction\n"
+         "  c | continue   resume execution\n"
+         "  h | help       this message\n"
+         "  q | quit       kill the target and exit");
 }
 
 static void run_debugger(void)
 {
     char line[256];
 
-    if (wait_child() < 0)  /* primo stop: SIGTRAP dopo execve */
+    if (wait_child() < 0)  /* first stop: SIGTRAP after execve */
         return;
-    printf("[*] target avviato, pid %d (stop su execve)\n", child);
+    printf("[*] target started, pid %d (stopped at execve)\n", child);
 
     for (;;) {
         printf("kdbg> ");
@@ -93,7 +93,7 @@ static void run_debugger(void)
             waitpid(child, NULL, 0);
             return;
         } else if (line[0]) {
-            printf("comando sconosciuto: %s (prova 'help')\n", line);
+            printf("unknown command: %s (try 'help')\n", line);
         }
     }
 }
@@ -101,7 +101,7 @@ static void run_debugger(void)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "uso: %s <programma> [argomenti...]\n", argv[0]);
+        fprintf(stderr, "usage: %s <program> [args...]\n", argv[0]);
         return 1;
     }
 
@@ -112,7 +112,7 @@ int main(int argc, char **argv)
     }
 
     if (child == 0) {
-        /* Figlio: chiede di essere tracciato, disattiva ASLR, esegue il target */
+        /* Child: request tracing, disable ASLR, exec the target */
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
             perror("PTRACE_TRACEME");
             _exit(1);
