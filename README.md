@@ -19,6 +19,8 @@ make
 | `c`, `continue` | resume execution |
 | `b <addr>` | set a breakpoint (e.g. `b 0x401136`) |
 | `bl` | list breakpoints |
+| `x <addr> [n]` | hexdump `n` bytes of memory (default 32) |
+| `set <addr> <value>` | write a 64-bit value at `addr` |
 | `h`, `help` | show help |
 | `q`, `quit` | kill the target and exit |
 
@@ -26,7 +28,7 @@ make
 
 - [x] **M1** – fork/exec the target, registers, single-step, continue
 - [x] **M2** – software breakpoints (`int3` / `0xCC`) at an address
-- [ ] **M3** – memory read/write (`x addr`, `set`)
+- [x] **M3** – memory read/write (`x addr`, `set`)
 - [ ] **M4** – symbols: ELF parsing (`.symtab`) → `break main`
 - [ ] **M5** – disassembly of the current instruction (Capstone)
 - [ ] **M6** – attach to a running process (`PTRACE_ATTACH`)
@@ -53,4 +55,21 @@ nm test/loop | grep -w add    # find the address of add()
 ./kdbg ./test/loop
 kdbg> b 0x401136
 kdbg> c                       # hit 3 times, once per loop iteration
+```
+
+## How it works (M3)
+
+- `x` reads memory word by word with `PTRACE_PEEKDATA` and prints a hexdump (hex + ASCII). Bytes covered by an active breakpoint are shown with their original value, so you see the real code instead of `0xCC`.
+- `set` writes a full 8-byte word with `PTRACE_POKEDATA`. Values are little-endian: `set addr 1337` writes `39 05 00 00 00 00 00 00`.
+
+Try it on `test/vars`, which prints a global number and string:
+
+```sh
+nm test/vars | grep -wE 'secret|message|show'
+./kdbg ./test/vars
+kdbg> b 0x401136              # address of show()
+kdbg> c
+kdbg> x 0x404020              # secret (42 = 0x2a) followed by message
+kdbg> set 0x404020 1337       # change secret
+kdbg> c                       # the program now prints secret = 1337
 ```

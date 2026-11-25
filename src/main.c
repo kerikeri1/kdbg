@@ -2,6 +2,7 @@
  * kdbg - minimal Linux x86_64 debugger based on ptrace(2)
  * Milestone 1: target launch, registers, single-step, continue.
  * Milestone 2: software breakpoints (int3 / 0xCC).
+ * Milestone 3: memory read/write (x, set).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
@@ -149,6 +151,73 @@ static int step_over_breakpoint(void)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Memory
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Read len bytes from the tracee starting at addr into buf.
+ * ptrace reads 8 bytes at a time, so we read word by word and copy only
+ * the bytes we need. Returns 0 on success, -1 on error.
+ */
+static int read_memory(uint64_t addr, uint8_t *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, child, (void *)(addr + done), NULL);
+        if (errno) {
+            printf("cannot read memory at 0x%lx: %s\n", addr + done, strerror(errno));
+            return -1;
+        }
+        size_t chunk = len - done < sizeof word ? len - done : sizeof word;
+        memcpy(buf + done, &word, chunk);
+        done += chunk;
+    }
+    return 0;
+}
+
+/*
+ * Show the bytes we placed 0xCC over with their original value, so the
+ * user sees the real program code and not our breakpoints.
+ */
+static void hide_breakpoints(uint64_t addr, uint8_t *buf, size_t len);
+
+/* x <addr> [count]: hexdump of count bytes (default 32), 16 per line */
+static void examine_memory(uint64_t addr, size_t count)
+{
+    uint8_t buf[256];
+    if (count > sizeof buf)
+        count = sizeof buf;
+    if (read_memory(addr, buf, count) < 0)
+        return;
+    hide_breakpoints(addr, buf, count);
+
+    for (size_t i = 0; i < count; i += 16) {
+        printf("0x%016lx: ", addr + i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < count)
+                printf("%02x ", buf[i + j]);
+            else
+                printf("   ");
+        }
+        printf(" |");
+        for (size_t j = 0; j < 16 && i + j < count; j++)
+            putchar(isprint(buf[i + j]) ? buf[i + j] : '.');
+        puts("|");
+    }
+}
+
+/* set <addr> <value>: write a 64-bit value (8 bytes) at addr */
+static void set_memory(uint64_t addr, uint64_t value)
+{
+    if (ptrace(PTRACE_POKEDATA, child, (void *)addr, (void *)value) < 0) {
+        printf("cannot write memory at 0x%lx: %s\n", addr, strerror(errno));
+        return;
+    }
+    printf("0x%lx <- 0x%lx\n", addr, value);
+}
+
 static void list_breakpoints(void)
 {
     if (bp_count == 0) {
@@ -202,6 +271,8 @@ static void help(void)
          "  c | continue   resume execution\n"
          "  b <addr>       set a breakpoint (e.g. b 0x401136)\n"
          "  bl             list breakpoints\n"
+         "  x <addr> [n]   dump n bytes of memory (default 32)\n"
+         "  set <addr> <v> write a 64-bit value at addr\n"
          "  h | help       this message\n"
          "  q | quit       kill the target and exit");
 }
@@ -246,8 +317,27 @@ static void run_debugger(void)
                 puts("usage: b <addr>");
             else
                 set_breakpoint(addr);
+        } else if (!strcmp(line, "b")) {
+            puts("usage: b <addr>");
         } else if (!strcmp(line, "bl")) {
             list_breakpoints();
+        } else if (!strcmp(line, "x") || !strncmp(line, "x ", 2)) {
+            char *end;
+            uint64_t addr = strtoull(line + 1, &end, 0);
+            if (end == line + 1) {
+                puts("usage: x <addr> [count]");
+            } else {
+                size_t count = strtoul(end, NULL, 0);
+                examine_memory(addr, count ? count : 32);
+            }
+        } else if (!strcmp(line, "set") || !strncmp(line, "set ", 4)) {
+            char *end1, *end2;
+            uint64_t addr  = strtoull(line + 3, &end1, 0);
+            uint64_t value = strtoull(end1, &end2, 0);
+            if (end1 == line + 3 || end2 == end1)
+                puts("usage: set <addr> <value>");
+            else
+                set_memory(addr, value);
         } else if (!strcmp(line, "h") || !strcmp(line, "help")) {
             help();
         } else if (!strcmp(line, "q") || !strcmp(line, "quit")) {
@@ -258,6 +348,13 @@ static void run_debugger(void)
             printf("unknown command: %s (try 'help')\n", line);
         }
     }
+}
+
+static void hide_breakpoints(uint64_t addr, uint8_t *buf, size_t len)
+{
+    for (int i = 0; i < bp_count; i++)
+        if (bps[i].enabled && bps[i].addr >= addr && bps[i].addr < addr + len)
+            buf[bps[i].addr - addr] = bps[i].orig_byte;
 }
 
 int main(int argc, char **argv)

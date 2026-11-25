@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -O0
 
-all: kdbg test/hello test/loop
+all: kdbg test/hello test/loop test/vars
 
 kdbg: src/main.c
 	$(CC) $(CFLAGS) -o $@ $^
@@ -12,7 +12,10 @@ test/hello: test/hello.c
 test/loop: test/loop.c
 	$(CC) -g -O0 -no-pie -o $@ $^
 
+test/vars: test/vars.c
+	$(CC) -g -O0 -no-pie -o $@ $^
+
 clean:
-	rm -f kdbg test/hello test/loop
+	rm -f kdbg test/hello test/loop test/vars
 
 .PHONY: all clean
