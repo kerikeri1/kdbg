@@ -3,6 +3,7 @@
  * Milestone 1: target launch, registers, single-step, continue.
  * Milestone 2: software breakpoints (int3 / 0xCC).
  * Milestone 3: memory read/write (x, set).
+ * Milestone 4: ELF symbols (b main, x secret, <func+off> in output).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,6 +18,8 @@
 #include <sys/user.h>
 #include <sys/personality.h>
 
+#include "elf.h"
+
 static pid_t child;
 
 static int wait_child(void);
@@ -26,6 +29,8 @@ static int wait_child(void);
  * the signal and notifies us. We must pass it back on the next PTRACE_CONT /
  * PTRACE_SINGLESTEP, otherwise the signal is discarded. */
 static int pending_signal;
+
+static void print_location(uint64_t addr);
 
 /* ---------------------------------------------------------------------------
  * Breakpoints
@@ -100,7 +105,9 @@ static int set_breakpoint(uint64_t addr)
         return -1;
 
     bps[bp_count++] = (struct breakpoint){ .addr = addr, .orig_byte = orig, .enabled = 1 };
-    printf("breakpoint %d at 0x%lx\n", bp_count - 1, addr);
+    printf("breakpoint %d at ", bp_count - 1);
+    print_location(addr);
+    putchar('\n');
     return 0;
 }
 
@@ -120,7 +127,9 @@ static void handle_breakpoint_hit(void)
     if (!bp || !bp->enabled)
         return;
 
-    printf("hit breakpoint %ld at 0x%lx\n", (long)(bp - bps), bp->addr);
+    printf("hit breakpoint %ld at ", (long)(bp - bps));
+    print_location(bp->addr);
+    putchar('\n');
 
     /* Put the original instruction back */
     if (write_byte(bp->addr, bp->orig_byte, NULL) < 0)
@@ -231,7 +240,11 @@ static void list_breakpoints(void)
         return;
     }
     for (int i = 0; i < bp_count; i++)
-        printf("%d: 0x%lx %s\n", i, bps[i].addr, bps[i].enabled ? "enabled" : "disabled");
+    {
+        printf("%d: ", i);
+        print_location(bps[i].addr);
+        printf(" %s\n", bps[i].enabled ? "enabled" : "disabled");
+    }
 }
 
 /* Wait for the child: returns 0 if it is still alive (stopped), -1 if it has terminated */
@@ -274,27 +287,88 @@ static void print_regs(void)
     printf("eflags 0x%llx\n", r.eflags);
 }
 
+/* Print addr as "0x401126 <show+4>" when it falls inside a known symbol */
+static void print_location(uint64_t addr)
+{
+    const struct symbol *sym = elf_symbol_at(addr);
+    if (!sym)
+        printf("0x%lx", addr);
+    else if (addr == sym->addr)
+        printf("0x%lx <%s>", addr, sym->name);
+    else
+        printf("0x%lx <%s+%lu>", addr, sym->name, addr - sym->addr);
+}
+
+/*
+ * Parse the first token of str as an address: either a number
+ * (0x401126, 4198694) or a symbol name (show, secret).
+ * On success stores the address in *addr, sets *rest to the text after
+ * the token and returns 0. Returns -1 if the token is missing, -2 if it is
+ * an unknown symbol (an error message is already printed).
+ */
+static int parse_address(const char *str, uint64_t *addr, char **rest)
+{
+    while (*str == ' ')
+        str++;
+    if (!*str)
+        return -1;
+
+    /* Numbers start with a digit */
+    if (isdigit((unsigned char)*str)) {
+        char *end;
+        *addr = strtoull(str, &end, 0);
+        if (rest)
+            *rest = end;
+        return 0;
+    }
+
+    /* Otherwise it is a symbol name: copy the token and look it up */
+    char name[128];
+    size_t len = strcspn(str, " ");
+    if (len >= sizeof name)
+        return -1;
+    memcpy(name, str, len);
+    name[len] = '\0';
+
+    const struct symbol *sym = elf_find_symbol(name);
+    if (!sym) {
+        printf("unknown symbol: %s\n", name);
+        return -2;
+    }
+    *addr = sym->addr;
+    if (rest)
+        *rest = (char *)str + len;
+    return 0;
+}
+
 static void help(void)
 {
     puts("commands:\n"
          "  r | regs       show registers\n"
          "  s | step       execute a single instruction\n"
          "  c | continue   resume execution\n"
-         "  b <addr>       set a breakpoint (e.g. b 0x401136)\n"
+         "  b <loc>        set a breakpoint (e.g. b main, b 0x401126)\n"
          "  bl             list breakpoints\n"
-         "  x <addr> [n]   dump n bytes of memory (default 32)\n"
-         "  set <addr> <v> write a 64-bit value at addr\n"
+         "  x <loc> [n]    dump n bytes of memory (default 32)\n"
+         "  set <loc> <v>  write a 64-bit value at loc\n"
+         "  syms           list function symbols\n"
          "  h | help       this message\n"
-         "  q | quit       kill the target and exit");
+         "  q | quit       kill the target and exit\n"
+         "<loc> is an address or a symbol name");
+
 }
 
-static void run_debugger(void)
+static void run_debugger(const char *path)
 {
     char line[256];
 
     if (wait_child() < 0)  /* first stop: SIGTRAP after execve */
         return;
     printf("[*] target started, pid %d (stopped at execve)\n", child);
+
+    int n = elf_load_symbols(path, child);
+    if (n >= 0)
+        printf("[*] loaded %d symbols from %s\n", n, path);
 
     for (;;) {
         printf("kdbg> ");
@@ -315,40 +389,48 @@ static void run_debugger(void)
             }
             struct user_regs_struct r;
             ptrace(PTRACE_GETREGS, child, NULL, &r);
-            printf("rip = 0x%llx\n", r.rip);
+            printf("rip = ");
+            print_location(r.rip);
+            putchar('\n');
         } else if (!strcmp(line, "c") || !strcmp(line, "continue")) {
             if (step_over_breakpoint() < 0) return;
             ptrace(PTRACE_CONT, child, NULL, (void *)(long)pending_signal);
             if (wait_child() < 0) return;
             handle_breakpoint_hit();
-        } else if (!strncmp(line, "b ", 2)) {
-            char *end;
-            uint64_t addr = strtoull(line + 2, &end, 0);
-            if (end == line + 2)
-                puts("usage: b <addr>");
-            else
+        } else if (!strcmp(line, "b") || !strncmp(line, "b ", 2)) {
+            uint64_t addr;
+            int rc = parse_address(line + 1, &addr, NULL);
+            if (rc == -1)
+                puts("usage: b <addr|symbol>");
+            else if (rc == 0)
                 set_breakpoint(addr);
-        } else if (!strcmp(line, "b")) {
-            puts("usage: b <addr>");
         } else if (!strcmp(line, "bl")) {
             list_breakpoints();
         } else if (!strcmp(line, "x") || !strncmp(line, "x ", 2)) {
+            uint64_t addr;
             char *end;
-            uint64_t addr = strtoull(line + 1, &end, 0);
-            if (end == line + 1) {
-                puts("usage: x <addr> [count]");
-            } else {
+            int rc = parse_address(line + 1, &addr, &end);
+            if (rc == -1) {
+                puts("usage: x <addr|symbol> [count]");
+            } else if (rc == 0) {
                 size_t count = strtoul(end, NULL, 0);
                 examine_memory(addr, count ? count : 32);
             }
         } else if (!strcmp(line, "set") || !strncmp(line, "set ", 4)) {
+            uint64_t addr;
             char *end1, *end2;
-            uint64_t addr  = strtoull(line + 3, &end1, 0);
-            uint64_t value = strtoull(end1, &end2, 0);
-            if (end1 == line + 3 || end2 == end1)
-                puts("usage: set <addr> <value>");
-            else
-                set_memory(addr, value);
+            int rc = parse_address(line + 3, &addr, &end1);
+            if (rc == -1) {
+                puts("usage: set <addr|symbol> <value>");
+            } else if (rc == 0) {
+                uint64_t value = strtoull(end1, &end2, 0);
+                if (end2 == end1)
+                    puts("usage: set <addr|symbol> <value>");
+                else
+                    set_memory(addr, value);
+            }
+        } else if (!strcmp(line, "syms")) {
+            elf_list_functions();
         } else if (!strcmp(line, "h") || !strcmp(line, "help")) {
             help();
         } else if (!strcmp(line, "q") || !strcmp(line, "quit")) {
@@ -393,6 +475,7 @@ int main(int argc, char **argv)
         _exit(1);
     }
 
-    run_debugger();
+    run_debugger(argv[1]);
+    elf_free_symbols();
     return 0;
 }

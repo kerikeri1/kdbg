@@ -4,3 +4,4 @@ test/hello
 test/loop
 test/vars
 test/crash
+test/vars_pie

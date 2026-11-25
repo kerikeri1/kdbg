@@ -1,10 +1,10 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g -O0
 
-all: kdbg test/hello test/loop test/vars test/crash
+all: kdbg test/hello test/loop test/vars test/crash test/vars_pie
 
-kdbg: src/main.c
-	$(CC) $(CFLAGS) -o $@ $^
+kdbg: src/main.c src/elf.c src/elf.h
+	$(CC) $(CFLAGS) -o $@ src/main.c src/elf.c
 
 test/hello: test/hello.c
 	$(CC) -g -O0 -no-pie -o $@ $^
@@ -18,7 +18,11 @@ test/vars: test/vars.c
 test/crash: test/crash.c
 	$(CC) -g -O0 -no-pie -o $@ $^
 
+# Same program built as PIE, to test the load base handling
+test/vars_pie: test/vars.c
+	$(CC) -g -O0 -pie -fPIE -o $@ $^
+
 clean:
-	rm -f kdbg test/hello test/loop test/vars test/crash
+	rm -f kdbg test/hello test/loop test/vars test/crash test/vars_pie
 
 .PHONY: all clean

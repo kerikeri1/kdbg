@@ -19,19 +19,22 @@ make
 | `r`, `regs` | show registers |
 | `s`, `step` | execute a single instruction |
 | `c`, `continue` | resume execution |
-| `b <addr>` | set a breakpoint (e.g. `b 0x401136`) |
+| `b <loc>` | set a breakpoint (e.g. `b main`, `b 0x401126`) |
 | `bl` | list breakpoints |
-| `x <addr> [n]` | hexdump `n` bytes of memory (default 32) |
-| `set <addr> <value>` | write a 64-bit value at `addr` |
+| `x <loc> [n]` | hexdump `n` bytes of memory (default 32) |
+| `set <loc> <value>` | write a 64-bit value at `loc` |
+| `syms` | list function symbols |
 | `h`, `help` | show help |
 | `q`, `quit` | kill the target and exit |
+
+`<loc>` is either an address (`0x401126`) or a symbol name (`show`, `secret`).
 
 ## Roadmap
 
 - [x] **M1** – fork/exec the target, registers, single-step, continue
 - [x] **M2** – software breakpoints (`int3` / `0xCC`) at an address
 - [x] **M3** – memory read/write (`x addr`, `set`)
-- [ ] **M4** – symbols: ELF parsing (`.symtab`) → `break main`
+- [x] **M4** – symbols: ELF parsing (`.symtab`) → `break main`
 - [ ] **M5** – disassembly of the current instruction (Capstone)
 - [ ] **M6** – attach to a running process (`PTRACE_ATTACH`)
 - [ ] **M7** – backtrace by walking the `rbp` chain
@@ -85,4 +88,26 @@ When the tracee receives a signal (e.g. `SIGSEGV`), the kernel stops it *before*
 kdbg> c        # stopped by signal 11 (Segmentation fault)
 kdbg> r        # inspect the registers at the crash
 kdbg> c        # signal delivered: process killed by signal 11
+```
+
+## How it works (M4)
+
+The ELF parser lives in `src/elf.c`:
+
+1. Read the whole file and check the magic bytes (`\x7fELF`) and the 64-bit class.
+2. Walk the section header table (`e_shoff`, `e_shnum`) looking for `SHT_SYMTAB`.
+3. Symbol names are not stored in the symbols: `st_name` is an offset into the string table, whose index is the symbol table's `sh_link`.
+4. Keep defined `STT_FUNC` and `STT_OBJECT` symbols.
+5. For PIE binaries (`ET_DYN`) addresses are relative to 0: the runtime load base is read from `/proc/<pid>/maps` and added to each symbol.
+
+Stripped binaries have no `.symtab`, so only raw addresses work on them.
+
+```sh
+./kdbg ./test/vars         # also try ./test/vars_pie
+kdbg> syms
+kdbg> b show
+kdbg> c                    # hit breakpoint 0 at 0x401126 <show>
+kdbg> s                    # rip = 0x401127 <show+1>
+kdbg> x secret 8
+kdbg> set secret 1337
 ```
