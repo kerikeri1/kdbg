@@ -3,3 +3,4 @@ test/hello
 *.o
 test/loop
 test/vars
+test/crash

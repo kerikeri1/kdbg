@@ -21,6 +21,12 @@ static pid_t child;
 
 static int wait_child(void);
 
+/* Signal that stopped the tracee and has not been delivered yet (0 = none).
+ * When the tracee receives a signal, the kernel stops it BEFORE delivering
+ * the signal and notifies us. We must pass it back on the next PTRACE_CONT /
+ * PTRACE_SINGLESTEP, otherwise the signal is discarded. */
+static int pending_signal;
+
 /* ---------------------------------------------------------------------------
  * Breakpoints
  *
@@ -244,8 +250,13 @@ static int wait_child(void)
         printf("[*] process killed by signal %d\n", WTERMSIG(status));
         return -1;
     }
-    if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP)
-        printf("[*] stopped by signal %d\n", WSTOPSIG(status));
+    pending_signal = 0;
+    if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
+        /* SIGTRAP is ours (breakpoints, single-step): never forward it */
+        pending_signal = WSTOPSIG(status);
+        printf("[*] stopped by signal %d (%s), will be delivered on resume\n",
+               pending_signal, strsignal(pending_signal));
+    }
     return 0;
 }
 
@@ -299,7 +310,7 @@ static void run_debugger(void)
                 /* the single-step is done by step_over_breakpoint() */
                 if (step_over_breakpoint() < 0) return;
             } else {
-                ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+                ptrace(PTRACE_SINGLESTEP, child, NULL, (void *)(long)pending_signal);
                 if (wait_child() < 0) return;
             }
             struct user_regs_struct r;
@@ -307,7 +318,7 @@ static void run_debugger(void)
             printf("rip = 0x%llx\n", r.rip);
         } else if (!strcmp(line, "c") || !strcmp(line, "continue")) {
             if (step_over_breakpoint() < 0) return;
-            ptrace(PTRACE_CONT, child, NULL, NULL);
+            ptrace(PTRACE_CONT, child, NULL, (void *)(long)pending_signal);
             if (wait_child() < 0) return;
             handle_breakpoint_hit();
         } else if (!strncmp(line, "b ", 2)) {
