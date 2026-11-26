@@ -7,6 +7,8 @@
  * Milestone 5: disassembly with Capstone (dis, current instruction on stop).
  * Milestone 6: attach to a running process (kdbg -p <pid>).
  * Milestone 7: backtrace by walking the rbp chain (bt).
+ * Extra: next (step over calls) and finish (run until return).
+ * Extra: hardware watchpoints with the debug registers DR0-DR7 (watch).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -20,6 +22,7 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/personality.h>
+#include <stddef.h>
 #include <signal.h>
 
 #include <capstone/capstone.h>
@@ -52,6 +55,18 @@ static int wait_child(void);
  * the signal and notifies us. We must pass it back on the next PTRACE_CONT /
  * PTRACE_SINGLESTEP, otherwise the signal is discarded. */
 static int pending_signal;
+
+/* Last resume request (PTRACE_CONT or PTRACE_SINGLESTEP), repeated when a
+ * harmless signal is passed through without stopping (see wait_child). */
+static int last_request = PTRACE_CONT;
+
+/* Resume the tracee, delivering the pending signal if there is one */
+static void resume(int request)
+{
+    last_request = request;
+    ptrace(request, child, NULL, (void *)(long)pending_signal);
+    pending_signal = 0;
+}
 
 static void print_location(uint64_t addr);
 static void show_current_instruction(void);
@@ -141,25 +156,29 @@ static int set_breakpoint(uint64_t addr)
  * Called after every stop caused by "continue".
  * If the tracee stopped on one of our breakpoints: restore the original
  * instruction, move rip back by one and remember to re-arm it later.
+ * Returns the breakpoint that was hit, or NULL. With quiet != 0 nothing
+ * is printed (used by next/finish for their internal breakpoints).
  */
-static void handle_breakpoint_hit(void)
+static struct breakpoint *handle_breakpoint_hit(int quiet)
 {
     struct user_regs_struct r;
     if (ptrace(PTRACE_GETREGS, child, NULL, &r) < 0)
-        return;
+        return NULL;
 
     /* After executing int3 (1 byte), rip points to addr + 1 */
     struct breakpoint *bp = find_breakpoint(r.rip - 1);
     if (!bp || !bp->enabled)
-        return;
+        return NULL;
 
-    printf("hit breakpoint %ld at ", (long)(bp - bps));
-    print_location(bp->addr);
-    putchar('\n');
+    if (!quiet) {
+        printf("hit breakpoint %ld at ", (long)(bp - bps));
+        print_location(bp->addr);
+        putchar('\n');
+    }
 
     /* Put the original instruction back */
     if (write_byte(bp->addr, bp->orig_byte, NULL) < 0)
-        return;
+        return NULL;
     bp->enabled = 0;
 
     /* Rewind rip so the original instruction gets executed */
@@ -167,7 +186,26 @@ static void handle_breakpoint_hit(void)
     ptrace(PTRACE_SETREGS, child, NULL, &r);
 
     pending_rearm = bp;
-    show_current_instruction();
+    if (!quiet)
+        show_current_instruction();
+    return bp;
+}
+
+/* Delete a breakpoint: restore its byte and remove it from the array */
+static void remove_breakpoint(struct breakpoint *bp)
+{
+    if (bp->enabled)
+        write_byte(bp->addr, bp->orig_byte, NULL);
+
+    /* the array is compacted, so fix the pointer to the pending one */
+    if (pending_rearm == bp)
+        pending_rearm = NULL;
+    else if (pending_rearm > bp)
+        pending_rearm--;
+
+    int idx = bp - bps;
+    memmove(&bps[idx], &bps[idx + 1], (bp_count - idx - 1) * sizeof *bps);
+    bp_count--;
 }
 
 /*
@@ -184,13 +222,156 @@ static int step_over_breakpoint(void)
     struct breakpoint *bp = pending_rearm;
     pending_rearm = NULL;
 
-    ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+    resume(PTRACE_SINGLESTEP);
     if (wait_child() < 0)
         return -1;
 
     if (write_byte(bp->addr, 0xCC, NULL) == 0)
         bp->enabled = 1;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Hardware watchpoints
+ *
+ * x86 CPUs have 4 debug address registers (DR0-DR3) plus a control register
+ * (DR7) and a status register (DR6). The CPU itself watches the addresses:
+ * no memory is modified, unlike software breakpoints.
+ *
+ * DR7, for each slot i (0-3):
+ *   bit  2*i          L_i   local enable
+ *   bits 16+4*i..17   RW_i  condition: 01 = write, 11 = read or write
+ *   bits 18+4*i..19   LEN_i size:      00 = 1, 01 = 2, 11 = 4, 10 = 8 bytes
+ * DR6 bits 0-3 tell which slot triggered.
+ *
+ * Data watchpoints are "trap-like": the CPU stops AFTER the instruction
+ * that accessed the memory, so rip already points to the next one.
+ * Userspace cannot touch debug registers directly: we go through ptrace
+ * (PTRACE_POKEUSER at the offset of u_debugreg[i] in struct user).
+ * ------------------------------------------------------------------------- */
+#define MAX_WATCHPOINTS 4
+
+struct watchpoint {
+    uint64_t addr;
+    int      len;        /* 1, 2, 4 or 8 bytes */
+    int      access;     /* 0 = write only, 1 = read or write */
+    int      used;
+    uint64_t last_value; /* to print old -> new */
+};
+
+static struct watchpoint wps[MAX_WATCHPOINTS];
+
+static int read_memory(uint64_t addr, uint8_t *buf, size_t len);
+
+static long get_debugreg(int i)
+{
+    return ptrace(PTRACE_PEEKUSER, child,
+                  (void *)offsetof(struct user, u_debugreg[i]), NULL);
+}
+
+static int set_debugreg(int i, unsigned long value)
+{
+    return ptrace(PTRACE_POKEUSER, child,
+                  (void *)offsetof(struct user, u_debugreg[i]), (void *)value);
+}
+
+static uint64_t read_watched(const struct watchpoint *wp)
+{
+    uint64_t v = 0;
+    read_memory(wp->addr, (uint8_t *)&v, wp->len);  /* little-endian */
+    return v;
+}
+
+static int set_watchpoint(uint64_t addr, int len, int access)
+{
+    if (len != 1 && len != 2 && len != 4 && len != 8) {
+        puts("length must be 1, 2, 4 or 8");
+        return -1;
+    }
+    /* the CPU requires the address to be aligned to the length */
+    if (addr % len) {
+        printf("address must be aligned to %d bytes\n", len);
+        return -1;
+    }
+
+    int i;
+    for (i = 0; i < MAX_WATCHPOINTS && wps[i].used; i++)
+        ;
+    if (i == MAX_WATCHPOINTS) {
+        puts("no free debug register (max 4 watchpoints)");
+        return -1;
+    }
+
+    static const int len_bits[9] = { [1] = 0, [2] = 1, [4] = 3, [8] = 2 };
+    unsigned long dr7 = get_debugreg(7);
+    dr7 &= ~(0xfUL << (16 + 4 * i));                   /* clear RW_i and LEN_i */
+    dr7 |= (unsigned long)(access ? 3 : 1) << (16 + 4 * i);
+    dr7 |= (unsigned long)len_bits[len] << (18 + 4 * i);
+    dr7 |= 1UL << (2 * i);                             /* L_i */
+
+    /* address first, then enable it in DR7 */
+    if (set_debugreg(i, addr) < 0 || set_debugreg(7, dr7) < 0) {
+        perror("PTRACE_POKEUSER (debug registers)");
+        return -1;
+    }
+
+    wps[i] = (struct watchpoint){ .addr = addr, .len = len, .access = access, .used = 1 };
+    wps[i].last_value = read_watched(&wps[i]);
+    printf("watchpoint %d (%s, %d bytes) at ", i, access ? "read/write" : "write", len);
+    print_location(addr);
+    putchar('\n');
+    return 0;
+}
+
+static void remove_watchpoint(int i)
+{
+    unsigned long dr7 = get_debugreg(7);
+    dr7 &= ~(1UL << (2 * i));
+    dr7 &= ~(0xfUL << (16 + 4 * i));
+    set_debugreg(7, dr7);
+    set_debugreg(i, 0);
+    wps[i].used = 0;
+}
+
+/*
+ * After a SIGTRAP: check DR6 to see whether a watchpoint fired.
+ * Returns 1 if it did (and prints what happened), 0 otherwise.
+ */
+static int check_watchpoints(void)
+{
+    unsigned long dr6 = get_debugreg(6);
+    int hit = 0;
+
+    for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+        if (!wps[i].used || !(dr6 & (1UL << i)))
+            continue;
+        hit = 1;
+        uint64_t value = read_watched(&wps[i]);
+        printf("watchpoint %d hit at ", i);
+        print_location(wps[i].addr);
+        if (value != wps[i].last_value)
+            printf(": 0x%lx -> 0x%lx (%ld -> %ld)\n",
+                   wps[i].last_value, value, wps[i].last_value, value);
+        else
+            printf(": accessed, value 0x%lx (%ld)\n", value, value);
+        wps[i].last_value = value;
+    }
+
+    /* the CPU never clears DR6 by itself */
+    if (dr6 & 0xf)
+        set_debugreg(6, 0);
+    return hit;
+}
+
+static void list_watchpoints(void)
+{
+    for (int i = 0; i < MAX_WATCHPOINTS; i++) {
+        if (!wps[i].used)
+            continue;
+        printf("w%d: ", i);
+        print_location(wps[i].addr);
+        printf(" %s, %d bytes\n", wps[i].access ? "read/write" : "write", wps[i].len);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -349,21 +530,41 @@ static void list_breakpoints(void)
 }
 
 /* Wait for the child: returns 0 if it is still alive (stopped), -1 if it has terminated */
+/*
+ * Signals that GDB also passes to the program without stopping: they are
+ * normal events (terminal resized, child exited, timers) and stopping on
+ * every one of them would only get in the way.
+ */
+static int is_silent_signal(int sig)
+{
+    return sig == SIGWINCH || sig == SIGCHLD || sig == SIGURG ||
+           sig == SIGALRM || sig == SIGPROF || sig == SIGVTALRM || sig == SIGIO;
+}
+
 static int wait_child(void)
 {
     int status;
-    if (waitpid(child, &status, 0) < 0) {
-        perror("waitpid");
-        return -1;
+    for (;;) {
+        if (waitpid(child, &status, 0) < 0) {
+            perror("waitpid");
+            return -1;
+        }
+        if (WIFEXITED(status)) {
+            printf("[*] process exited, exit code %d\n", WEXITSTATUS(status));
+            return -1;
+        }
+        if (WIFSIGNALED(status)) {
+            printf("[*] process killed by signal %d\n", WTERMSIG(status));
+            return -1;
+        }
+        /* harmless signal: deliver it and repeat the last request */
+        if (WIFSTOPPED(status) && is_silent_signal(WSTOPSIG(status))) {
+            ptrace(last_request, child, NULL, (void *)(long)WSTOPSIG(status));
+            continue;
+        }
+        break;
     }
-    if (WIFEXITED(status)) {
-        printf("[*] process exited, exit code %d\n", WEXITSTATUS(status));
-        return -1;
-    }
-    if (WIFSIGNALED(status)) {
-        printf("[*] process killed by signal %d\n", WTERMSIG(status));
-        return -1;
-    }
+
     pending_signal = 0;
     if (WIFSTOPPED(status) && interrupted &&
         (WSTOPSIG(status) == SIGINT || WSTOPSIG(status) == SIGSTOP)) {
@@ -551,6 +752,131 @@ static void backtrace(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * next / finish
+ *
+ * Both are built on a temporary breakpoint:
+ *   next   - if the current instruction is a call, put a breakpoint on the
+ *            instruction after it and continue; otherwise single-step.
+ *   finish - put a breakpoint on the return address and continue.
+ * The rsp check handles recursion: the same address can be hit by a deeper
+ * call of the same function, which has a lower rsp (the stack grows down).
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Continue until target is reached with rsp >= min_rsp.
+ * Stops early if a user breakpoint is hit or a signal arrives.
+ * Returns 0 if the tracee is still alive, -1 if it terminated.
+ */
+static int run_until(uint64_t target, uint64_t min_rsp)
+{
+    int temporary = 0;
+    if (!find_breakpoint(target)) {
+        if (bp_count >= MAX_BREAKPOINTS) {
+            puts("too many breakpoints");
+            return 0;
+        }
+        uint8_t orig;
+        if (write_byte(target, 0xCC, &orig) < 0)
+            return 0;
+        bps[bp_count++] = (struct breakpoint){ .addr = target, .orig_byte = orig, .enabled = 1 };
+        temporary = 1;
+    }
+
+    for (;;) {
+        if (step_over_breakpoint() < 0)
+            return -1;
+        resume(PTRACE_CONT);
+        if (wait_child() < 0)
+            return -1;
+
+        if (check_watchpoints())
+            break;  /* a watchpoint fired on the way */
+        struct breakpoint *bp = handle_breakpoint_hit(1);
+        if (!bp)
+            break;  /* stopped by a signal or Ctrl+C */
+
+        if (bp->addr == target) {
+            struct user_regs_struct r;
+            ptrace(PTRACE_GETREGS, child, NULL, &r);
+            if (r.rsp >= min_rsp)
+                break;      /* reached, in the right frame */
+            continue;       /* recursive call: keep going */
+        }
+
+        /* a user breakpoint was hit on the way: stop there, like GDB */
+        printf("hit breakpoint %ld at ", (long)(bp - bps));
+        print_location(bp->addr);
+        putchar('\n');
+        break;
+    }
+
+    if (temporary) {
+        struct breakpoint *tmp = find_breakpoint(target);
+        if (tmp)
+            remove_breakpoint(tmp);
+    }
+    return 0;
+}
+
+/* Single-step one instruction, handling a breakpoint we are stopped on */
+static int single_step(void)
+{
+    if (pending_rearm)
+        return step_over_breakpoint();  /* it does the single-step itself */
+    resume(PTRACE_SINGLESTEP);
+    return wait_child();
+}
+
+static int next_instruction(void)
+{
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, child, NULL, &r) < 0)
+        return 0;
+
+    uint8_t code[MAX_INSN_LEN];
+    if (read_memory(r.rip, code, sizeof code) < 0)
+        return 0;
+    hide_breakpoints(r.rip, code, sizeof code);
+
+    cs_insn *insn;
+    if (cs_disasm(cs_handle, code, sizeof code, r.rip, 1, &insn) != 1)
+        return single_step();
+
+    int is_call = !strcmp(insn->mnemonic, "call");
+    uint64_t after = r.rip + insn->size;  /* where the call returns */
+    cs_free(insn, 1);
+
+    if (!is_call)
+        return single_step();
+    return run_until(after, r.rsp);  /* after the call, rsp is back to this value */
+}
+
+static int finish_function(void)
+{
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, child, NULL, &r) < 0)
+        return 0;
+
+    /* Same logic as frame #1 of the backtrace */
+    uint64_t ret;
+    int state = prologue_state(r.rip);
+    uint64_t slot = state < 2 ? r.rsp + 8 * state : r.rbp + 8;
+    if (read_u64(slot, &ret) < 0) {
+        puts("cannot find the return address");
+        return 0;
+    }
+
+    /* After ret the return address is popped: rsp ends up above the slot */
+    if (run_until(ret, slot + 8) < 0)
+        return -1;
+
+    ptrace(PTRACE_GETREGS, child, NULL, &r);
+    if (r.rip == ret)
+        printf("returned, rax = 0x%llx (%lld)\n", r.rax, (long long)r.rax);
+    return 0;
+}
+
 /*
  * Leave the tracee as we found it: remove every 0xCC we wrote, then
  * detach (attach mode) or kill it (launch mode).
@@ -574,9 +900,15 @@ static void help(void)
     puts("commands:\n"
          "  r | regs       show registers\n"
          "  s | step       execute a single instruction\n"
+         "  n | next       step over calls\n"
+         "  f | finish     run until the current function returns\n"
          "  c | continue   resume execution\n"
          "  b <loc>        set a breakpoint (e.g. b main, b 0x401126)\n"
          "  bl             list breakpoints\n"
+         "  d <n>          delete breakpoint n\n"
+         "  watch <loc> [len]   stop when loc is written (len: 1/2/4/8)\n"
+         "  awatch <loc> [len]  stop when loc is read or written\n"
+         "  unwatch <n>    delete watchpoint n\n"
          "  x <loc> [n]    dump n bytes of memory (default 32)\n"
          "  set <loc> <v>  write a 64-bit value at loc\n"
          "  dis [loc] [n]  disassemble n instructions (default: 8 from rip)\n"
@@ -626,19 +958,23 @@ static void run_debugger(const char *path)
         if (!strcmp(line, "r") || !strcmp(line, "regs")) {
             print_regs();
         } else if (!strcmp(line, "s") || !strcmp(line, "step")) {
-            if (pending_rearm) {
-                /* the single-step is done by step_over_breakpoint() */
-                if (step_over_breakpoint() < 0) return;
-            } else {
-                ptrace(PTRACE_SINGLESTEP, child, NULL, (void *)(long)pending_signal);
-                if (wait_child() < 0) return;
-            }
+            if (single_step() < 0) return;
+            check_watchpoints();
+            show_current_instruction();
+        } else if (!strcmp(line, "n") || !strcmp(line, "next")) {
+            if (next_instruction() < 0) return;
+            show_current_instruction();
+        } else if (!strcmp(line, "f") || !strcmp(line, "finish")) {
+            if (finish_function() < 0) return;
             show_current_instruction();
         } else if (!strcmp(line, "c") || !strcmp(line, "continue")) {
             if (step_over_breakpoint() < 0) return;
-            ptrace(PTRACE_CONT, child, NULL, (void *)(long)pending_signal);
+            resume(PTRACE_CONT);
             if (wait_child() < 0) return;
-            handle_breakpoint_hit();
+            if (check_watchpoints())
+                show_current_instruction();
+            else
+                handle_breakpoint_hit(0);
         } else if (!strcmp(line, "b") || !strncmp(line, "b ", 2)) {
             uint64_t addr;
             int rc = parse_address(line + 1, &addr, NULL);
@@ -646,8 +982,36 @@ static void run_debugger(const char *path)
                 puts("usage: b <addr|symbol>");
             else if (rc == 0)
                 set_breakpoint(addr);
+        } else if (!strcmp(line, "d") || !strncmp(line, "d ", 2)) {
+            char *end;
+            long idx = strtol(line + 1, &end, 10);
+            if (end == line + 1 || idx < 0 || idx >= bp_count)
+                puts("usage: d <breakpoint number> (see 'bl')");
+            else
+                remove_breakpoint(&bps[idx]);
         } else if (!strcmp(line, "bl")) {
             list_breakpoints();
+            list_watchpoints();
+        } else if (!strncmp(line, "watch", 5) || !strncmp(line, "awatch", 6)) {
+            /* watch <loc> [len]  /  awatch <loc> [len] */
+            int access = line[0] == 'a';
+            const char *args = line + (access ? 6 : 5);
+            uint64_t addr;
+            char *end;
+            int rc = parse_address(args, &addr, &end);
+            if (rc == -1) {
+                puts("usage: watch|awatch <addr|symbol> [1|2|4|8]");
+            } else if (rc == 0) {
+                long len = strtol(end, NULL, 0);
+                set_watchpoint(addr, len ? len : 8, access);
+            }
+        } else if (!strncmp(line, "unwatch", 7)) {
+            char *end;
+            long idx = strtol(line + 7, &end, 10);
+            if (end == line + 7 || idx < 0 || idx >= MAX_WATCHPOINTS || !wps[idx].used)
+                puts("usage: unwatch <n> (see 'bl')");
+            else
+                remove_watchpoint(idx);
         } else if (!strcmp(line, "x") || !strncmp(line, "x ", 2)) {
             uint64_t addr;
             char *end;

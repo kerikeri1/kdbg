@@ -8,3 +8,5 @@ test/vars_pie
 test/nested
 test/sleeper
 test/vars_stripped
+test/recursive
+test/watch
