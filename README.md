@@ -68,7 +68,7 @@ Extras:
 - [x] `next` / `finish`
 - [x] hardware watchpoints (`DR0`–`DR7`)
 - [x] syscall tracing (`PTRACE_SYSCALL`)
-- [ ] PLT symbol names (`printf@plt`)
+- [x] PLT symbol names (`printf@plt`)
 - [ ] stack overflow lab
 
 ## How it works (M1)
@@ -135,7 +135,7 @@ The ELF parser lives in `src/elf.c`:
 4. Keep defined `STT_FUNC` and `STT_OBJECT` symbols.
 5. For PIE binaries (`ET_DYN`) addresses are relative to 0: the runtime load base is read from `/proc/<pid>/maps` and added to each symbol.
 
-Stripped binaries have no `.symtab`, so only raw addresses work on them.
+Stripped binaries have no `.symtab`: only raw addresses and PLT names (see below) work on them.
 
 ```sh
 ./kdbg ./test/vars         # also try ./test/vars_pie
@@ -260,4 +260,28 @@ openat(-100, "/does/not/exist", 0x0) = -1 ENOENT (No such file or directory)
 ./kdbg ./test/files
 kdbg> strace openat        # stop after the next openat
 kdbg> bt                   # who called it?
+```
+
+## How it works: PLT names
+
+A call to a library function like `printf` is really a call to a small **PLT stub** inside the program, which has no entry in `.symtab`:
+
+```
+printf@plt:  [endbr64]  jmp qword ptr [rip + disp]   ; ff 25 <disp32>
+```
+
+The stub jumps through a **GOT** slot that the dynamic linker fills with the real address of `printf`. Each relocation in `.rela.plt` maps a GOT slot (`r_offset`) to a symbol in `.dynsym`, whose name is in `.dynstr`. So kdbg:
+
+1. scans `.plt` and `.plt.sec` (used when CET/IBT is enabled) in 16-byte steps;
+2. finds the `ff 25` jump in each stub and computes its GOT slot (RIP-relative: end of the jump + `disp32`);
+3. looks up the relocation for that slot and names the stub `<symbol>@plt`.
+
+These names survive `strip`, because the dynamic linker needs `.dynsym` and `.rela.plt` at runtime.
+
+```sh
+./kdbg ./test/vars
+kdbg> dis show 12          # call 0x401030 <printf@plt>
+kdbg> b printf@plt
+kdbg> c
+kdbg> bt                   # printf@plt <- show <- main
 ```
