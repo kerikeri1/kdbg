@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -g -O0
 LDLIBS  = -lcapstone
 
-all: kdbg test/hello test/loop test/vars test/crash test/vars_pie test/nested test/sleeper test/recursive test/watch
+all: kdbg test/hello test/loop test/vars test/crash test/vars_pie test/nested test/sleeper test/recursive test/watch test/files
 
 kdbg: src/main.c src/elf.c src/elf.h
 	$(CC) $(CFLAGS) -o $@ src/main.c src/elf.c $(LDLIBS)
@@ -28,6 +28,9 @@ test/recursive: test/recursive.c
 test/watch: test/watch.c
 	$(CC) -g -O0 -no-pie -o $@ $^
 
+test/files: test/files.c
+	$(CC) -g -O0 -no-pie -o $@ $^
+
 test/sleeper: test/sleeper.c
 	$(CC) -g -O0 -no-pie -o $@ $^
 
@@ -36,6 +39,6 @@ test/vars_pie: test/vars.c
 	$(CC) -g -O0 -pie -fPIE -o $@ $^
 
 clean:
-	rm -f kdbg test/hello test/loop test/vars test/crash test/vars_pie test/nested test/sleeper test/recursive test/watch
+	rm -f kdbg test/hello test/loop test/vars test/crash test/vars_pie test/nested test/sleeper test/recursive test/watch test/files
 
 .PHONY: all clean

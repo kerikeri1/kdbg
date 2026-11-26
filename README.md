@@ -45,6 +45,7 @@ Press **Ctrl+C** while the target is running to stop it and get back to the prom
 | `x <loc> [n]` | hexdump `n` bytes of memory (default 32) |
 | `set <loc> <value>` | write a 64-bit value at `loc` |
 | `dis [loc] [n]` | disassemble `n` instructions (default: 8 from `rip`) |
+| `strace [name]` | trace syscalls; with a name, stop after the next call of that syscall |
 | `bt` | backtrace (call stack) |
 | `syms` | list function symbols |
 | `h`, `help` | show help |
@@ -66,7 +67,7 @@ Extras:
 
 - [x] `next` / `finish`
 - [x] hardware watchpoints (`DR0`–`DR7`)
-- [ ] syscall tracing (`PTRACE_SYSCALL`)
+- [x] syscall tracing (`PTRACE_SYSCALL`)
 - [ ] PLT symbol names (`printf@plt`)
 - [ ] stack overflow lab
 
@@ -237,4 +238,26 @@ kdbg> watch balance
 kdbg> c                    # watchpoint 0 hit: 100 -> 150, inside deposit()
 kdbg> bt                   # who changed it?
 kdbg> c                    # 150 -> 120, inside withdraw()
+```
+
+## How it works: syscall tracing
+
+`PTRACE_SYSCALL` works like `PTRACE_CONT`, but the tracee also stops at every syscall **entry** and **exit**.
+
+- `PTRACE_O_TRACESYSGOOD` makes these stops report `SIGTRAP | 0x80`, so they cannot be confused with breakpoints.
+- x86-64 syscall ABI: number in `orig_rax`, arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (`r10` instead of `rcx`, because the `syscall` instruction overwrites `rcx`), return value in `rax`. Errors are returned as `-errno`.
+- At the entry stop the kernel has already set `rax = -ENOSYS`: that is how entry and exit are told apart.
+- The line is printed at the exit stop, when the return value is known; the arguments are still in their registers because `syscall` only clobbers `rcx`, `r11` and `rax`.
+- Syscall names come from `src/syscalls.h`, generated from `<asm/unistd_64.h>`. String and buffer arguments are decoded for `write`, `openat`, `open`, `access`, `execve`, `unlink`.
+
+```sh
+./kdbg ./test/files
+kdbg> strace               # every syscall, including the dynamic loader's
+...
+openat(-100, "/etc/hostname", 0x0) = 3
+openat(-100, "/does/not/exist", 0x0) = -1 ENOENT (No such file or directory)
+
+./kdbg ./test/files
+kdbg> strace openat        # stop after the next openat
+kdbg> bt                   # who called it?
 ```

@@ -9,6 +9,7 @@
  * Milestone 7: backtrace by walking the rbp chain (bt).
  * Extra: next (step over calls) and finish (run until return).
  * Extra: hardware watchpoints with the debug registers DR0-DR7 (watch).
+ * Extra: syscall tracing with PTRACE_SYSCALL (strace).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include <capstone/capstone.h>
 
 #include "elf.h"
+#include "syscalls.h"
 
 static pid_t child;
 static int attached;  /* 1 if we attached with -p (detach on exit, don't kill) */
@@ -59,6 +61,9 @@ static int pending_signal;
 /* Last resume request (PTRACE_CONT or PTRACE_SINGLESTEP), repeated when a
  * harmless signal is passed through without stopping (see wait_child). */
 static int last_request = PTRACE_CONT;
+
+/* 1 if the last stop was a syscall entry/exit (PTRACE_SYSCALL) */
+static int syscall_stop;
 
 /* Resume the tracee, delivering the pending signal if there is one */
 static void resume(int request)
@@ -566,6 +571,15 @@ static int wait_child(void)
     }
 
     pending_signal = 0;
+    syscall_stop = 0;
+
+    /* With PTRACE_O_TRACESYSGOOD, syscall stops report SIGTRAP | 0x80,
+     * so they can't be confused with breakpoints or real signals */
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80)) {
+        syscall_stop = 1;
+        return 0;
+    }
+
     if (WIFSTOPPED(status) && interrupted &&
         (WSTOPSIG(status) == SIGINT || WSTOPSIG(status) == SIGSTOP)) {
         interrupted = 0;
@@ -877,6 +891,154 @@ static int finish_function(void)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Syscall tracing
+ *
+ * PTRACE_SYSCALL is like PTRACE_CONT, but the tracee also stops at every
+ * syscall entry and exit. The x86_64 syscall ABI:
+ *
+ *   orig_rax       syscall number
+ *   rdi rsi rdx r10 r8 r9   arguments (r10, not rcx: syscall clobbers rcx)
+ *   rax            return value (at exit); -errno on error
+ *
+ * At the entry stop the kernel has already set rax = -ENOSYS, which is how
+ * we tell entry and exit apart.
+ * ------------------------------------------------------------------------- */
+
+/* Print a string from the tracee's memory, escaped, at most max bytes */
+static void print_tracee_string(uint64_t addr, size_t len, int nul_terminated)
+{
+    enum { MAX_SHOWN = 32 };
+    uint8_t buf[MAX_SHOWN + 8];
+    size_t want = (nul_terminated || len > MAX_SHOWN) ? MAX_SHOWN : len;
+
+    if (!addr) {
+        printf("NULL");
+        return;
+    }
+    if (read_memory(addr, buf, want) < 0) {
+        printf("0x%lx", addr);
+        return;
+    }
+
+    putchar('"');
+    size_t i;
+    for (i = 0; i < want; i++) {
+        uint8_t c = buf[i];
+        if (nul_terminated && c == '\0')
+            break;
+        if (c == '\n')      printf("\\n");
+        else if (c == '\t') printf("\\t");
+        else if (c == '"')  printf("\\\"");
+        else if (isprint(c)) putchar(c);
+        else                printf("\\x%02x", c);
+    }
+    putchar('"');
+    if ((nul_terminated && i == want) || (!nul_terminated && len > want))
+        printf("...");
+}
+
+/* Print "name(arg, arg, ...)" for the syscall the tracee is entering */
+static void print_syscall_entry(const struct user_regs_struct *r)
+{
+    long nr = (long)r->orig_rax;
+    uint64_t a[6] = { r->rdi, r->rsi, r->rdx, r->r10, r->r8, r->r9 };
+    const char *name = (nr >= 0 && (size_t)nr < SYSCALL_COUNT && syscall_names[nr])
+                       ? syscall_names[nr] : NULL;
+
+    if (name)
+        printf("%s(", name);
+    else
+        printf("syscall_%ld(", nr);
+
+    /* A few syscalls get their string/buffer arguments decoded */
+    if (name && !strcmp(name, "write")) {
+        printf("%ld, ", (long)a[0]);
+        print_tracee_string(a[1], a[2], 0);
+        printf(", %lu)", a[2]);
+    } else if (name && !strcmp(name, "openat")) {
+        printf("%d, ", (int)a[0]);
+        print_tracee_string(a[1], 0, 1);
+        printf(", 0x%lx)", a[2]);
+    } else if (name && (!strcmp(name, "open") || !strcmp(name, "access") ||
+                        !strcmp(name, "execve") || !strcmp(name, "unlink"))) {
+        print_tracee_string(a[0], 0, 1);
+        printf(", 0x%lx, 0x%lx)", a[1], a[2]);
+    } else if (name && (!strcmp(name, "exit") || !strcmp(name, "exit_group") ||
+                        !strcmp(name, "close"))) {
+        printf("%ld)", (long)a[0]);
+    } else {
+        /* generic: the first three arguments in hex */
+        printf("0x%lx, 0x%lx, 0x%lx)", a[0], a[1], a[2]);
+    }
+}
+
+static void print_syscall_exit(long ret)
+{
+    if (ret < 0 && ret >= -4095)
+        printf(" = -1 %s (%s)\n", strerrorname_np(-ret) ? strerrorname_np(-ret) : "?",
+               strerror(-ret));
+    else if (ret > 0xffff)
+        printf(" = 0x%lx\n", ret);   /* likely a pointer (mmap, brk) */
+    else
+        printf(" = %ld\n", ret);
+}
+
+/*
+ * strace [name]: run printing every syscall. With a name, print only that
+ * syscall and stop right after the first one completes (a "catchpoint").
+ * Breakpoints, watchpoints, signals and Ctrl+C stop the tracing too.
+ * Returns 0 if the tracee is still alive, -1 if it terminated.
+ */
+static int trace_syscalls(const char *filter)
+{
+    int matched = 0;  /* the current syscall matches the filter */
+
+    for (;;) {
+        if (step_over_breakpoint() < 0)
+            return -1;
+        resume(PTRACE_SYSCALL);
+        if (wait_child() < 0)
+            return -1;
+
+        if (!syscall_stop) {
+            /* something else stopped the tracee: report it and stop tracing */
+            if (check_watchpoints())
+                show_current_instruction();
+            else
+                handle_breakpoint_hit(0);
+            return 0;
+        }
+
+        struct user_regs_struct r;
+        ptrace(PTRACE_GETREGS, child, NULL, &r);
+        int entry = ((long)r.rax == -ENOSYS);
+
+        long nr = (long)r.orig_rax;
+        const char *name = (nr >= 0 && (size_t)nr < SYSCALL_COUNT) ? syscall_names[nr] : NULL;
+
+        if (entry) {
+            matched = !filter || (name && !strcmp(name, filter));
+            /* exit/exit_group never return: print them now */
+            if (matched && name && (!strcmp(name, "exit") || !strcmp(name, "exit_group"))) {
+                print_syscall_entry(&r);
+                printf(" = ?\n");
+            }
+        } else if (matched) {
+            /*
+             * Print the whole line at the exit stop, so the program's own
+             * output does not end up in the middle of it. The arguments are
+             * still in rdi, rsi, rdx, r10, r8, r9: the syscall instruction
+             * only clobbers rcx, r11 and rax.
+             */
+            print_syscall_entry(&r);
+            print_syscall_exit((long)r.rax);
+            if (filter)
+                return 0;  /* catchpoint reached: back to the prompt */
+        }
+    }
+}
+
 /*
  * Leave the tracee as we found it: remove every 0xCC we wrote, then
  * detach (attach mode) or kill it (launch mode).
@@ -912,6 +1074,7 @@ static void help(void)
          "  x <loc> [n]    dump n bytes of memory (default 32)\n"
          "  set <loc> <v>  write a 64-bit value at loc\n"
          "  dis [loc] [n]  disassemble n instructions (default: 8 from rip)\n"
+         "  strace [name]  trace syscalls (with a name: stop after the next one)\n"
          "  bt             backtrace (call stack)\n"
          "  syms           list function symbols\n"
          "  h | help       this message\n"
@@ -941,6 +1104,9 @@ static void run_debugger(const char *path)
             return;
         printf("[*] target started, pid %d (stopped at execve)\n", child);
     }
+
+    /* Make syscall stops distinguishable from breakpoints (SIGTRAP | 0x80) */
+    ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)PTRACE_O_TRACESYSGOOD);
 
     int n = elf_load_symbols(path, child);
     if (n >= 0)
@@ -1050,6 +1216,13 @@ static void run_debugger(const char *path)
                 size_t count = strtoul(end, NULL, 0);
                 disassemble(addr, count ? count : 8);
             }
+        } else if (!strcmp(line, "strace") || !strncmp(line, "strace ", 7)) {
+            const char *filter = line[6] ? line + 7 : NULL;
+            while (filter && *filter == ' ')
+                filter++;
+            if (filter && !*filter)
+                filter = NULL;
+            if (trace_syscalls(filter) < 0) return;
         } else if (!strcmp(line, "bt")) {
             backtrace();
         } else if (!strcmp(line, "syms")) {
